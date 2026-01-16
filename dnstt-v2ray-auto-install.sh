@@ -1,24 +1,8 @@
 #!/bin/bash
 
 ################################################################################
-# DNSTT + V2Ray/Xray Automated Integration Script
-# 
-# This script automatically sets up:
-# - dnstt DNS tunnel server with SOCKS5 proxy
-# - V2Ray or Xray server configured to route through dnstt
-# - Generates client configuration and subscription links
-# - Complete firewall and security setup
-#
-# Requirements:
-# - Fresh Ubuntu/Debian/CentOS/Rocky Linux VPS
-# - Root or sudo access
-# - Domain name with DNS configured
-#
-# Usage:
-#   bash <(curl -Ls https://raw.githubusercontent.com/YOUR_REPO/setup.sh)
-#   or
-#   wget https://raw.githubusercontent.com/YOUR_REPO/setup.sh && bash setup.sh
-#
+# DNSTT + V2Ray/Xray Automated Integration Script v2.0
+# Fixed: Better handling of dnstt interactive installation
 ################################################################################
 
 set -e
@@ -59,7 +43,7 @@ print_banner() {
     cat << "EOF"
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
-║     DNSTT + V2Ray/Xray Automated Setup Script           ║
+║     DNSTT + V2Ray/Xray Automated Setup Script v2.0      ║
 ║     DNS Tunnel with V2Ray Protocol Integration           ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
@@ -83,26 +67,6 @@ detect_os() {
     fi
     
     log "Detected OS: $OS $VER"
-}
-
-check_dependencies() {
-    log "Checking for required commands..."
-    
-    local deps=("curl" "wget" "systemctl")
-    for dep in "${deps[@]}"; do
-        if ! command -v $dep &> /dev/null; then
-            warn "$dep not found, installing..."
-            case $OS in
-                ubuntu|debian)
-                    apt-get update -qq
-                    apt-get install -y $dep
-                    ;;
-                centos|rhel|rocky|fedora)
-                    yum install -y $dep
-                    ;;
-            esac
-        fi
-    done
 }
 
 generate_uuid() {
@@ -220,35 +184,59 @@ collect_user_input() {
 # Installation Functions
 ################################################################################
 
-install_dnstt() {
-    log "=== Installing dnstt DNS Tunnel ==="
+install_dnstt_manual() {
+    log "=== Installing dnstt DNS Tunnel (Manual Method) ==="
     
-    # Create temporary expect script for automation
-    cat > /tmp/dnstt-setup.exp << EOF
-#!/usr/bin/expect -f
-set timeout 300
-
-spawn bash -c "curl -Ls https://raw.githubusercontent.com/bugfloyd/dnstt-deploy/main/dnstt-deploy.sh | bash"
-
-expect "Enter the nameserver subdomain*"
-send "${DNS_DOMAIN}\r"
-
-expect "Enter the MTU*"
-send "${DNS_MTU}\r"
-
-expect "Select tunnel mode*"
-send "1\r"
-
-expect eof
+    # First, ensure we have the dnstt-deploy script
+    log "Installing dnstt-deploy script..."
+    bash <(curl -Ls https://raw.githubusercontent.com/bugfloyd/dnstt-deploy/main/dnstt-deploy.sh) --install-only 2>/dev/null || {
+        # If that fails, download and install manually
+        curl -Ls https://raw.githubusercontent.com/bugfloyd/dnstt-deploy/main/dnstt-deploy.sh -o /usr/local/bin/dnstt-deploy
+        chmod +x /usr/local/bin/dnstt-deploy
+    }
+    
+    # Now run the interactive setup by feeding answers via here-document
+    log "Running dnstt configuration..."
+    
+    # Create a response file
+    cat > /tmp/dnstt-responses.txt << EOF
+${DNS_DOMAIN}
+${DNS_MTU}
+1
 EOF
     
-    chmod +x /tmp/dnstt-setup.exp
+    # Run dnstt-deploy with responses
+    /usr/local/bin/dnstt-deploy < /tmp/dnstt-responses.txt || {
+        warn "Automated input may have failed, trying alternative method..."
+        
+        # Alternative: Use expect if available, otherwise manual
+        if command -v expect &> /dev/null; then
+            install_dnstt_expect
+        else
+            error "dnstt installation failed. Please run 'dnstt-deploy' manually and then re-run this script with --skip-dnstt flag"
+        fi
+    }
     
-    # Install expect if not available
+    rm -f /tmp/dnstt-responses.txt
+    
+    # Verify installation
+    sleep 3
+    if systemctl is-active --quiet dnstt-server && systemctl is-active --quiet danted; then
+        log "dnstt installed successfully"
+    else
+        error "dnstt installation failed. Check logs: sudo journalctl -u dnstt-server -u danted -n 50"
+    fi
+}
+
+install_dnstt_expect() {
+    log "=== Installing dnstt with expect ==="
+    
+    # Install expect if needed
     if ! command -v expect &> /dev/null; then
         log "Installing expect..."
         case $OS in
             ubuntu|debian)
+                apt-get update -qq
                 apt-get install -y expect
                 ;;
             centos|rhel|rocky|fedora)
@@ -257,20 +245,47 @@ EOF
         esac
     fi
     
-    # Run automated installation
-    /tmp/dnstt-setup.exp || {
-        warn "Automated dnstt installation may have issues. Checking services..."
+    # Create expect script with longer timeout
+    cat > /tmp/dnstt-setup.exp << 'EXPECTEOF'
+#!/usr/bin/expect -f
+set timeout 600
+set domain [lindex $argv 0]
+set mtu [lindex $argv 1]
+
+spawn dnstt-deploy
+
+expect {
+    "Enter the nameserver subdomain*" {
+        send "$domain\r"
+        exp_continue
+    }
+    "Enter the MTU*" {
+        send "$mtu\r"
+        exp_continue
+    }
+    "Select tunnel mode*" {
+        send "1\r"
+        exp_continue
+    }
+    eof {
+        catch wait result
+        exit [lindex $result 3]
+    }
+    timeout {
+        puts "Timeout waiting for prompt"
+        exit 1
+    }
+}
+EXPECTEOF
+    
+    chmod +x /tmp/dnstt-setup.exp
+    
+    # Run with parameters
+    /tmp/dnstt-setup.exp "$DNS_DOMAIN" "$DNS_MTU" || {
+        error "dnstt installation via expect failed"
     }
     
     rm -f /tmp/dnstt-setup.exp
-    
-    # Verify installation
-    sleep 5
-    if systemctl is-active --quiet dnstt-server && systemctl is-active --quiet danted; then
-        log "dnstt installed successfully"
-    else
-        error "dnstt installation failed. Check logs: sudo journalctl -u dnstt-server -u danted"
-    fi
 }
 
 install_v2ray() {
@@ -293,9 +308,9 @@ configure_v2ray_vmess() {
     log "=== Configuring V2Ray (VMess) ==="
     
     local config_file="/usr/local/etc/v2ray/config.json"
+    mkdir -p /usr/local/etc/v2ray
     
     if [[ "$USE_TLS" == "yes" ]]; then
-        # VMess with TLS
         cat > "$config_file" << EOF
 {
   "log": {
@@ -311,8 +326,7 @@ configure_v2ray_vmess() {
         "clients": [
           {
             "id": "${UUID}",
-            "alterId": 0,
-            "email": "user@${V2RAY_DOMAIN}"
+            "alterId": 0
           }
         ]
       },
@@ -345,25 +359,11 @@ configure_v2ray_vmess() {
         ]
       },
       "tag": "dns-tunnel"
-    },
-    {
-      "protocol": "freedom",
-      "tag": "direct"
     }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "dns-tunnel",
-        "network": "tcp,udp"
-      }
-    ]
-  }
+  ]
 }
 EOF
     else
-        # VMess without TLS
         cat > "$config_file" << EOF
 {
   "log": {
@@ -384,8 +384,7 @@ EOF
         ]
       },
       "streamSettings": {
-        "network": "tcp",
-        "security": "none"
+        "network": "tcp"
       }
     }
   ],
@@ -401,28 +400,13 @@ EOF
         ]
       },
       "tag": "dns-tunnel"
-    },
-    {
-      "protocol": "freedom",
-      "tag": "direct"
     }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "dns-tunnel",
-        "network": "tcp,udp"
-      }
-    ]
-  }
+  ]
 }
 EOF
     fi
     
-    # Create log directory
     mkdir -p /var/log/v2ray
-    
     log "V2Ray configuration created"
 }
 
@@ -430,6 +414,7 @@ configure_xray_reality() {
     log "=== Configuring Xray (VLESS-Reality) ==="
     
     local config_file="/usr/local/etc/xray/config.json"
+    mkdir -p /usr/local/etc/xray
     
     # Generate Reality keys
     local keys_output=$(/usr/local/bin/xray x25519)
@@ -440,9 +425,7 @@ configure_xray_reality() {
     cat > "$config_file" << EOF
 {
   "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
+    "loglevel": "warning"
   },
   "inbounds": [
     {
@@ -452,8 +435,7 @@ configure_xray_reality() {
         "clients": [
           {
             "id": "${UUID}",
-            "flow": "xtls-rprx-vision",
-            "email": "user@reality"
+            "flow": "xtls-rprx-vision"
           }
         ],
         "decryption": "none"
@@ -466,8 +448,7 @@ configure_xray_reality() {
           "dest": "www.microsoft.com:443",
           "xver": 0,
           "serverNames": [
-            "www.microsoft.com",
-            "www.bing.com"
+            "www.microsoft.com"
           ],
           "privateKey": "${PRIVATE_KEY}",
           "shortIds": [
@@ -487,46 +468,27 @@ configure_xray_reality() {
             "port": 1080
           }
         ]
-      },
-      "tag": "dns-tunnel"
-    },
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "dns-tunnel",
-        "network": "tcp,udp"
       }
-    ]
-  }
+    }
+  ]
 }
 EOF
     
-    # Create log directory
     mkdir -p /var/log/xray
-    
     log "Xray Reality configuration created"
-    log "Public Key: $PUBLIC_KEY"
-    log "Short ID: $SHORT_ID"
 }
 
 configure_xray_trojan() {
     log "=== Configuring Xray (Trojan) ==="
     
     local config_file="/usr/local/etc/xray/config.json"
+    mkdir -p /usr/local/etc/xray
     
     if [[ "$USE_TLS" == "yes" ]]; then
         cat > "$config_file" << EOF
 {
   "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
+    "loglevel": "warning"
   },
   "inbounds": [
     {
@@ -535,8 +497,7 @@ configure_xray_trojan() {
       "settings": {
         "clients": [
           {
-            "password": "${PASSWORD}",
-            "email": "user@${V2RAY_DOMAIN}"
+            "password": "${PASSWORD}"
           }
         ]
       },
@@ -564,23 +525,9 @@ configure_xray_trojan() {
             "port": 1080
           }
         ]
-      },
-      "tag": "dns-tunnel"
-    },
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "dns-tunnel",
-        "network": "tcp,udp"
       }
-    ]
-  }
+    }
+  ]
 }
 EOF
     else
@@ -588,7 +535,6 @@ EOF
     fi
     
     mkdir -p /var/log/xray
-    
     log "Xray Trojan configuration created"
 }
 
@@ -599,10 +545,9 @@ install_ssl_certificate() {
     
     log "=== Installing SSL Certificate ==="
     
-    # Install certbot
     case $OS in
         ubuntu|debian)
-            apt-get update
+            apt-get update -qq
             apt-get install -y certbot
             ;;
         centos|rhel|rocky|fedora)
@@ -610,22 +555,18 @@ install_ssl_certificate() {
             ;;
     esac
     
-    # Stop services temporarily to use port 80
     systemctl stop v2ray 2>/dev/null || true
     systemctl stop xray 2>/dev/null || true
     
-    # Get certificate
     certbot certonly --standalone --non-interactive --agree-tos \
-        --email admin@${V2RAY_DOMAIN} \
+        --register-unsafely-without-email \
         -d ${V2RAY_DOMAIN} || {
-        warn "SSL certificate installation failed. You can manually install it later."
+        warn "SSL certificate installation failed."
         USE_TLS="no"
         return
     }
     
     log "SSL certificate installed successfully"
-    
-    # Setup auto-renewal
     systemctl enable certbot.timer 2>/dev/null || true
 }
 
@@ -633,16 +574,14 @@ configure_firewall() {
     log "=== Configuring Firewall ==="
     
     if command -v ufw &> /dev/null; then
-        # UFW (Ubuntu/Debian)
         ufw --force enable
         ufw allow 22/tcp comment 'SSH'
-        ufw allow 53/udp comment 'DNS Tunnel'
-        ufw allow ${V2RAY_PORT}/tcp comment 'V2Ray/Xray'
-        ufw allow 80/tcp comment 'HTTP (for SSL renewal)'
+        ufw allow 53/udp comment 'DNS'
+        ufw allow ${V2RAY_PORT}/tcp comment 'V2Ray'
+        ufw allow 80/tcp comment 'HTTP'
         ufw reload
-        log "UFW firewall configured"
+        log "UFW configured"
     elif command -v firewall-cmd &> /dev/null; then
-        # FirewallD (CentOS/Rocky/Fedora)
         systemctl start firewalld
         systemctl enable firewalld
         firewall-cmd --permanent --add-port=22/tcp
@@ -651,390 +590,131 @@ configure_firewall() {
         firewall-cmd --permanent --add-port=80/tcp
         firewall-cmd --reload
         log "FirewallD configured"
-    else
-        # Basic iptables
-        iptables -I INPUT -p tcp --dport 22 -j ACCEPT
-        iptables -I INPUT -p udp --dport 53 -j ACCEPT
-        iptables -I INPUT -p tcp --dport ${V2RAY_PORT} -j ACCEPT
-        iptables -I INPUT -p tcp --dport 80 -j ACCEPT
-        
-        # Save iptables rules
-        case $OS in
-            ubuntu|debian)
-                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-                ;;
-            centos|rhel|rocky|fedora)
-                iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
-                ;;
-        esac
-        
-        log "Basic iptables rules configured"
     fi
 }
 
 enable_bbr() {
-    log "=== Enabling BBR TCP Congestion Control ==="
+    log "=== Enabling BBR ==="
     
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        sysctl -p
+        sysctl -p > /dev/null
         log "BBR enabled"
-    else
-        log "BBR already enabled"
     fi
 }
 
 start_services() {
     log "=== Starting Services ==="
     
-    # Start and enable dnstt services
     systemctl restart dnstt-server
     systemctl restart danted
     systemctl enable dnstt-server
     systemctl enable danted
     
-    # Start and enable v2ray/xray
     case $PROTOCOL in
         v2ray)
             systemctl restart v2ray
             systemctl enable v2ray
             sleep 2
-            if systemctl is-active --quiet v2ray; then
-                log "V2Ray service started successfully"
-            else
-                error "V2Ray service failed to start. Check: journalctl -u v2ray -n 50"
-            fi
+            systemctl is-active --quiet v2ray || error "V2Ray failed to start"
             ;;
-        xray|xray-trojan)
+        *)
             systemctl restart xray
             systemctl enable xray
             sleep 2
-            if systemctl is-active --quiet xray; then
-                log "Xray service started successfully"
-            else
-                error "Xray service failed to start. Check: journalctl -u xray -n 50"
-            fi
+            systemctl is-active --quiet xray || error "Xray failed to start"
             ;;
     esac
     
-    log "All services started and enabled"
+    log "All services started"
 }
 
 verify_installation() {
     log "=== Verifying Installation ==="
     
-    local errors=0
+    systemctl is-active --quiet dnstt-server && log "✓ dnstt-server running" || warn "✗ dnstt-server not running"
+    systemctl is-active --quiet danted && log "✓ SOCKS5 running" || warn "✗ SOCKS5 not running"
     
-    # Check dnstt
-    if systemctl is-active --quiet dnstt-server; then
-        log "✓ dnstt-server is running"
-    else
-        warn "✗ dnstt-server is not running"
-        ((errors++))
-    fi
-    
-    # Check SOCKS5
-    if systemctl is-active --quiet danted; then
-        log "✓ SOCKS5 proxy is running"
-    else
-        warn "✗ SOCKS5 proxy is not running"
-        ((errors++))
-    fi
-    
-    # Check V2Ray/Xray
     case $PROTOCOL in
         v2ray)
-            if systemctl is-active --quiet v2ray; then
-                log "✓ V2Ray is running"
-            else
-                warn "✗ V2Ray is not running"
-                ((errors++))
-            fi
+            systemctl is-active --quiet v2ray && log "✓ V2Ray running" || warn "✗ V2Ray not running"
             ;;
-        xray|xray-trojan)
-            if systemctl is-active --quiet xray; then
-                log "✓ Xray is running"
-            else
-                warn "✗ Xray is not running"
-                ((errors++))
-            fi
+        *)
+            systemctl is-active --quiet xray && log "✓ Xray running" || warn "✗ Xray not running"
             ;;
     esac
-    
-    # Check ports
-    if ss -tuln | grep -q ":53 "; then
-        log "✓ Port 53 is listening (DNS)"
-    else
-        warn "✗ Port 53 is not listening"
-        ((errors++))
-    fi
-    
-    if ss -tuln | grep -q ":${V2RAY_PORT} "; then
-        log "✓ Port ${V2RAY_PORT} is listening (V2Ray/Xray)"
-    else
-        warn "✗ Port ${V2RAY_PORT} is not listening"
-        ((errors++))
-    fi
-    
-    if ss -tuln | grep -q ":1080 "; then
-        log "✓ Port 1080 is listening (SOCKS5)"
-    else
-        warn "✗ Port 1080 is not listening"
-        ((errors++))
-    fi
-    
-    if [ $errors -eq 0 ]; then
-        log "All checks passed! ✓"
-    else
-        warn "Some checks failed. Please review the logs."
-    fi
 }
-
-################################################################################
-# Client Configuration Generation
-################################################################################
 
 generate_vmess_link() {
-    local vmess_json=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "${PROXY_NAME}",
-  "add": "${SERVER_IP}",
-  "port": "${V2RAY_PORT}",
-  "id": "${UUID}",
-  "aid": "0",
-  "net": "$([ "$USE_TLS" == "yes" ] && echo "ws" || echo "tcp")",
-  "type": "none",
-  "host": "${V2RAY_DOMAIN}",
-  "path": "$([ "$USE_TLS" == "yes" ] && echo "/vmess" || echo "")",
-  "tls": "$([ "$USE_TLS" == "yes" ] && echo "tls" || echo "")"
-}
-EOF
-)
-    
-    echo "vmess://$(echo -n "$vmess_json" | base64 -w 0)"
+    local json="{\"v\":\"2\",\"ps\":\"${PROXY_NAME}\",\"add\":\"${SERVER_IP}\",\"port\":\"${V2RAY_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"net\":\"$([ "$USE_TLS" == "yes" ] && echo "ws" || echo "tcp")\",\"type\":\"none\",\"host\":\"${V2RAY_DOMAIN}\",\"path\":\"$([ "$USE_TLS" == "yes" ] && echo "/vmess" || echo "")\",\"tls\":\"$([ "$USE_TLS" == "yes" ] && echo "tls" || echo "")\"}"
+    echo "vmess://$(echo -n "$json" | base64 -w 0)"
 }
 
 generate_vless_link() {
-    local vless_link="vless://${UUID}@${SERVER_IP}:${V2RAY_PORT}?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${PROXY_NAME// /%20}"
-    echo "$vless_link"
+    echo "vless://${UUID}@${SERVER_IP}:${V2RAY_PORT}?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${PROXY_NAME// /%20}"
 }
 
 generate_trojan_link() {
-    local trojan_link="trojan://${PASSWORD}@${V2RAY_DOMAIN}:${V2RAY_PORT}?security=tls&sni=${V2RAY_DOMAIN}&type=tcp#${PROXY_NAME// /%20}"
-    echo "$trojan_link"
-}
-
-generate_qr_code() {
-    local link="$1"
-    local output_file="$2"
-    
-    if command -v qrencode &> /dev/null; then
-        qrencode -t ANSIUTF8 "$link"
-        qrencode -t PNG -o "$output_file" "$link" 2>/dev/null || true
-    else
-        info "Install qrencode to generate QR codes: apt install qrencode"
-    fi
+    echo "trojan://${PASSWORD}@${V2RAY_DOMAIN}:${V2RAY_PORT}?security=tls&sni=${V2RAY_DOMAIN}&type=tcp#${PROXY_NAME// /%20}"
 }
 
 save_configuration() {
     local config_dir="/root/dnstt-v2ray-config"
     mkdir -p "$config_dir"
     
-    local config_file="$config_dir/config.txt"
-    local info_file="$config_dir/client-info.txt"
-    
-    # Save server configuration
-    cat > "$config_file" << EOF
-=======================================================
-  DNSTT + V2Ray/Xray Server Configuration
-=======================================================
-
-Installation Date: $(date)
-Protocol: ${PROTOCOL_NAME}
-
-=== Server Information ===
-Server IP: ${SERVER_IP}
-DNS Domain: ${DNS_DOMAIN}
-V2Ray Domain: ${V2RAY_DOMAIN}
-V2Ray Port: ${V2RAY_PORT}
-DNS MTU: ${DNS_MTU}
-
-=== Credentials ===
-UUID: ${UUID}
-$([ "$PROTOCOL_CHOICE" == "3" ] && echo "Password: ${PASSWORD}")
-$([ "$PROTOCOL_CHOICE" == "2" ] && echo "Public Key: ${PUBLIC_KEY}")
-$([ "$PROTOCOL_CHOICE" == "2" ] && echo "Short ID: ${SHORT_ID}")
-
-=== Service Status ===
-dnstt-server: $(systemctl is-active dnstt-server)
-danted (SOCKS5): $(systemctl is-active danted)
-$([ "$PROTOCOL" == "v2ray" ] && echo "v2ray: $(systemctl is-active v2ray)")
-$([ "$PROTOCOL" != "v2ray" ] && echo "xray: $(systemctl is-active xray)")
-
-=== Management Commands ===
-Check status: dnstt-deploy (menu option 3)
-View logs: journalctl -u $([ "$PROTOCOL" == "v2ray" ] && echo "v2ray" || echo "xray") -f
-Restart services:
-  systemctl restart dnstt-server
-  systemctl restart danted
-  systemctl restart $([ "$PROTOCOL" == "v2ray" ] && echo "v2ray" || echo "xray")
-
-=======================================================
-EOF
-    
-    # Generate client link
     case $PROTOCOL_CHOICE in
-        1)
-            CLIENT_LINK=$(generate_vmess_link)
-            ;;
-        2)
-            CLIENT_LINK=$(generate_vless_link)
-            ;;
-        3)
-            CLIENT_LINK=$(generate_trojan_link)
-            ;;
+        1) CLIENT_LINK=$(generate_vmess_link) ;;
+        2) CLIENT_LINK=$(generate_vless_link) ;;
+        3) CLIENT_LINK=$(generate_trojan_link) ;;
     esac
     
-    # Save client information
-    cat > "$info_file" << EOF
+    cat > "$config_dir/client-info.txt" << EOF
 =======================================================
-  Client Configuration - Share with Users
+  Client Configuration
 =======================================================
 
-Proxy Name: ${PROXY_NAME}
 Protocol: ${PROTOCOL_NAME}
-
-=== Connection Link ===
-${CLIENT_LINK}
-
-=== Manual Configuration (if needed) ===
 Server: ${SERVER_IP}
 Port: ${V2RAY_PORT}
 UUID: ${UUID}
 $([ "$PROTOCOL_CHOICE" == "3" ] && echo "Password: ${PASSWORD}")
 $([ "$PROTOCOL_CHOICE" == "2" ] && echo "Public Key: ${PUBLIC_KEY}")
 $([ "$PROTOCOL_CHOICE" == "2" ] && echo "Short ID: ${SHORT_ID}")
-$([ "$USE_TLS" == "yes" ] && echo "TLS: Enabled")
-$([ "$USE_TLS" == "yes" ] && echo "SNI: ${V2RAY_DOMAIN}")
 
-=== Supported Clients ===
-Android: V2RayNG, SagerNet, Shadowsocket
-iOS: Shadowrocket, Quantumult X, Streisand
-Windows: V2RayN, Clash for Windows, NekoRay
-macOS: V2RayX, V2RayU, ClashX
-Linux: Qv2ray, V2Ray CLI
-
-=== How to Use ===
-1. Install a V2Ray/Xray compatible client
-2. Copy the connection link above
-3. Import into your client:
-   - Android/iOS: Scan QR code or paste link
-   - Windows/Mac: Import from clipboard
-4. Connect and enjoy!
-
-=== For Telegram ===
-After connecting V2Ray client:
-1. Open Telegram
-2. Settings → Data and Storage → Proxy Settings
-3. Add Proxy → SOCKS5
-4. Server: 127.0.0.1
-5. Port: 1080 (or your V2Ray local port)
+Connection Link:
+${CLIENT_LINK}
 
 =======================================================
 EOF
     
-    # Try to generate QR code
-    generate_qr_code "$CLIENT_LINK" "$config_dir/qrcode.png"
-    
     log "Configuration saved to: $config_dir"
 }
 
-################################################################################
-# Display Results
-################################################################################
-
 display_results() {
     echo ""
-    echo -e "${GREEN}╔═══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║                                                           ║${NC}"
-    echo -e "${GREEN}║          🎉 Installation Completed Successfully! 🎉       ║${NC}"
-    echo -e "${GREEN}║                                                           ║${NC}"
-    echo -e "${GREEN}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${GREEN}╔═════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║   🎉 Installation Completed Successfully!   ║${NC}"
+    echo -e "${GREEN}╚═════════════════════════════════════════════╝${NC}"
     echo ""
     
-    echo -e "${BLUE}=== Server Information ===${NC}"
-    echo "Protocol: $PROTOCOL_NAME"
-    echo "Server IP: $SERVER_IP"
-    echo "Port: $V2RAY_PORT"
+    echo -e "${BLUE}Protocol:${NC} $PROTOCOL_NAME"
+    echo -e "${BLUE}Server:${NC} $SERVER_IP:$V2RAY_PORT"
     echo ""
-    
-    echo -e "${BLUE}=== Client Connection Link ===${NC}"
-    echo -e "${YELLOW}$CLIENT_LINK${NC}"
+    echo -e "${YELLOW}Connection Link:${NC}"
+    echo "$CLIENT_LINK"
     echo ""
-    
-    echo -e "${BLUE}=== QR Code ===${NC}"
-    generate_qr_code "$CLIENT_LINK" "/tmp/qr.png"
+    echo "Configuration saved: /root/dnstt-v2ray-config/client-info.txt"
     echo ""
-    
-    echo -e "${BLUE}=== Configuration Files ===${NC}"
-    echo "Server config: /root/dnstt-v2ray-config/config.txt"
-    echo "Client info: /root/dnstt-v2ray-config/client-info.txt"
-    echo "QR Code: /root/dnstt-v2ray-config/qrcode.png (if available)"
-    echo ""
-    
-    echo -e "${BLUE}=== Management Commands ===${NC}"
-    echo "View status: systemctl status $([ "$PROTOCOL" == "v2ray" ] && echo "v2ray" || echo "xray")"
-    echo "View logs: journalctl -u $([ "$PROTOCOL" == "v2ray" ] && echo "v2ray" || echo "xray") -f"
-    echo "Restart: systemctl restart $([ "$PROTOCOL" == "v2ray" ] && echo "v2ray" || echo "xray")"
-    echo "dnstt menu: dnstt-deploy"
-    echo ""
-    
-    echo -e "${BLUE}=== Next Steps ===${NC}"
-    echo "1. Share the connection link with users"
-    echo "2. Users install V2Ray/Xray client app"
-    echo "3. Users import the link"
-    echo "4. Users can then use it with Telegram or any app"
-    echo ""
-    
-    echo -e "${GREEN}✓ Setup complete! Enjoy your DNS tunnel + V2Ray/Xray proxy!${NC}"
-    echo ""
-    
-    read -p "Press Enter to view detailed configuration..."
-    cat /root/dnstt-v2ray-config/client-info.txt
 }
-
-################################################################################
-# Cleanup and Error Handling
-################################################################################
-
-cleanup() {
-    log "Cleaning up temporary files..."
-    rm -f /tmp/dnstt-setup.exp
-}
-
-trap cleanup EXIT
-
-################################################################################
-# Main Installation Flow
-################################################################################
 
 main() {
     print_banner
-    
-    log "Starting DNSTT + V2Ray/Xray automated installation..."
-    
-    # Pre-installation checks
     check_root
     detect_os
-    check_dependencies
-    
-    # User configuration
     collect_user_input
     
-    # Installation steps
-    install_dnstt
+    install_dnstt_manual
     
     case $PROTOCOL in
         v2ray)
@@ -1053,24 +733,12 @@ main() {
             ;;
     esac
     
-    # Configuration and optimization
     configure_firewall
     enable_bbr
-    
-    # Start services
     start_services
-    
-    # Verification
     verify_installation
-    
-    # Save configuration
     save_configuration
-    
-    # Display results
     display_results
-    
-    log "Installation completed at $(date)"
 }
 
-# Run main function
 main "$@"
